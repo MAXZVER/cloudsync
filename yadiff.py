@@ -406,6 +406,16 @@ header .meta{font:12px/1.3 -apple-system,BlinkMacSystemFont,sans-serif;color:var
   background-image:linear-gradient(90deg,var(--srv-w) 0 3px,transparent 3px)}
 .code.c.fromR{background-color:#26382c;
   background-image:linear-gradient(90deg,var(--loc-w) 0 3px,transparent 3px)}
+.code.c.man{background-color:#3a3326;
+  background-image:linear-gradient(90deg,#b58b2e 0 3px,transparent 3px)}
+.code.c.edit{cursor:text}
+#blockedit{position:absolute;z-index:15;box-sizing:border-box;margin:0;padding:0 10px;
+  border:2px solid var(--accent);border-radius:5px;background:#1b2430;color:var(--text);
+  font:14px/22px ui-monospace,SFMono-Regular,Menlo,Consolas,monospace;
+  resize:none;outline:none;overflow:hidden;white-space:pre-wrap;word-break:break-word;tab-size:4}
+#edithint{position:absolute;z-index:16;transform:translateY(-100%);
+  background:var(--accent);color:#fff;border-radius:4px 4px 0 0;padding:1px 7px;
+  font:11px/16px -apple-system,BlinkMacSystemFont,sans-serif;white-space:nowrap}
 .code.l.d em.w{background:var(--srv-w);font-style:normal;border-radius:3px;padding:1px 2px}
 .code.r.d em.w{background:var(--loc-w);font-style:normal;border-radius:3px;padding:1px 2px}
 .code.empty{background:repeating-linear-gradient(135deg,#26272b,#26272b 7px,#1e1f22 7px,#1e1f22 14px)}
@@ -444,10 +454,6 @@ kbd{background:#33353a;border:1px solid #4a4c50;border-bottom-width:2px;border-r
     padding:1px 6px;font:11px/18px ui-monospace,monospace;color:#cfd2d6}
 @media (max-width:1300px){.hints{display:none}}
 
-#edit{position:absolute;inset:0;display:none;z-index:20;background:#202124}
-#edit textarea{width:100%;height:100%;border:0;outline:none;resize:none;padding:12px 16px;
-               background:#202124;color:var(--text);
-               font:14px/22px ui-monospace,SFMono-Regular,Menlo,monospace}
 </style>
 
 <header>
@@ -463,14 +469,13 @@ kbd{background:#33353a;border:1px solid #4a4c50;border-bottom-width:2px;border-r
   <span class="count" id="pos">—</span>
   <button class="btn icon" onclick="jump(1)" title="Следующее различие (F7)">&#9660;</button>
   <span class="sep"></span>
-  <button class="btn" id="editbtn" onclick="toggleEdit()">Править вручную</button>
+  <button class="btn" id="editbtn" onclick="editCurrent()">Править участок</button>
 </header>
 
 <div id="main">
   <div id="scroll">
     <div class="colhead" id="colhead"></div>
     <div id="grid"><svg id="rib"></svg></div>
-    <div id="edit"><textarea id="rtext" spellcheck="false"></textarea></div>
   </div>
   <div id="ruler"></div>
 </div>
@@ -479,7 +484,7 @@ kbd{background:#33353a;border:1px solid #4a4c50;border-bottom-width:2px;border-r
   <span id="stat"></span>
   <span class="sp"></span>
   <span class="hints"><kbd>F7</kbd> различия &nbsp; <kbd>&#8592;</kbd><kbd>&#8594;</kbd> взять или вернуть
-        &nbsp; <kbd>&#8984;Z</kbd> отмена</span>
+        &nbsp; <kbd>&#8984;Z</kbd> отмена &nbsp; двойной клик по центру — правка</span>
   <button class="btn" onclick="send('cancel')">Отмена</button>
   <button class="btn go" onclick="send('apply')">Сохранить и синхронизировать</button>
 </footer>
@@ -488,7 +493,7 @@ kbd{background:#33353a;border:1px solid #4a4c50;border-bottom-width:2px;border-r
 const D = __DATA__, MERGE = __MERGEABLE__;
 document.documentElement.style.setProperty('--grid', '46px 1fr 54px 46px 1.05fr 54px 46px 1fr');
 const diffIds = [...new Set(D.rows.filter(r => r.kind === 'diff').map(r => r.block))];
-let cur = 0, manual = false, editing = false;
+let cur = 0, editing = null;      // editing = id участка, который правят руками
 let hist = [], hpos = 0;
 
 // Шеврон всегда показывает, куда поедет кусок. Не выбран — указывает в центр
@@ -504,39 +509,62 @@ function picksOf(id){ return D.blocks[id].picks || []; }
 function hasPick(id, side){ return picksOf(id).indexOf(side) >= 0; }
 function esc(s){ return s.replace(/[&<>]/g, c => ({'&':'&amp;','<':'&lt;','>':'&gt;'}[c])); }
 
+// Строки участка в результате. Ручная правка перекрывает выбор сторон — но не
+// стирает его: вернуть стрелки можно отменой.
+function blockLines(b){
+  if (b.manual) return b.manual;
+  if (b.tag === 'same') return b.left;
+  const out = [];
+  for (const s of (b.picks || [])) out.push(...(s === 'left' ? b.left : b.right));
+  return out;
+}
 function mergedLines(){
   const out = [];
-  for (const b of D.blocks) {
-    if (b.tag === 'same') { out.push(...b.left); continue; }
-    for (const s of (b.picks || [])) out.push(...(s === 'left' ? b.left : b.right));
-  }
+  for (const b of D.blocks) out.push(...blockLines(b));
   return out;
+}
+function snap(id){
+  const b = D.blocks[id];
+  return {picks: (b.picks || []).slice(), manual: b.manual ? b.manual.slice() : null};
+}
+function applyState(id, st){
+  const b = D.blocks[id];
+  b.picks = st.picks.slice();
+  b.manual = st.manual ? st.manual.slice() : null;
+}
+function setManual(id, lines){
+  const was = snap(id);
+  const base = (D.blocks[id].tag === 'same' ? D.blocks[id].left
+                : blockLines(D.blocks[id]));
+  // Правка, совпавшая с тем, что и так было, — не правка.
+  const same = lines.length === base.length && lines.every((l, i) => l === base[i]);
+  step([{block: id, from: was, to: {picks: was.picks, manual: same ? null : lines}}]);
 }
 // Нажатие на сторону включает или выключает её. Порядок нажатий = порядок строк
 // в результате, поэтому отдельных кнопок «сначала левое» не нужно.
 function toggle(id, side){
-  const was = picksOf(id).slice(), now = was.slice();
+  const now = picksOf(id).slice();
   const i = now.indexOf(side);
   if (i >= 0) now.splice(i, 1); else now.push(side);
-  step([{block: id, from: was, to: now}]);
+  step([{block: id, from: snap(id), to: {picks: now, manual: null}}]);
 }
 function addSide(id, side, where){
   const was = picksOf(id).slice();
   if (was.indexOf(side) >= 0) return;
   const now = was.slice();
   if (where === 'start') now.unshift(side); else now.push(side);
-  step([{block: id, from: was, to: now}]);
+  step([{block: id, from: snap(id), to: {picks: now, manual: null}}]);
 }
 function removeSide(id, side){
-  const was = picksOf(id).slice();
-  step([{block: id, from: was, to: was.filter(s => s !== side)}]);
+  const now = picksOf(id).filter(s => s !== side);
+  step([{block: id, from: snap(id), to: {picks: now, manual: null}}]);
 }
 function movePick(id, side, dir){
   const was = picksOf(id).slice(), now = was.slice();
   const i = now.indexOf(side), j = i + dir;
   if (i < 0 || j < 0 || j >= now.length) return;
   now[i] = was[j]; now[j] = was[i];
-  step([{block: id, from: was, to: now}]);
+  step([{block: id, from: snap(id), to: {picks: now, manual: null}}]);
 }
 function step(changes){
   changes = changes.filter(c => JSON.stringify(c.from) !== JSON.stringify(c.to));
@@ -544,20 +572,20 @@ function step(changes){
   hist = hist.slice(0, hpos);
   hist.push(changes);
   hpos = hist.length;
-  changes.forEach(c => D.blocks[c.block].picks = c.to.slice());
+  changes.forEach(c => applyState(c.block, c.to));
   render();
 }
 function undo(){
   if (!hpos) return;
   hpos--;
-  hist[hpos].forEach(c => D.blocks[c.block].picks = c.from.slice());
+  hist[hpos].forEach(c => applyState(c.block, c.from));
   const b = hist[hpos][0].block;
   if (diffIds.includes(b)) cur = diffIds.indexOf(b);
   render(); focusCur();
 }
 function redo(){
   if (hpos >= hist.length) return;
-  hist[hpos].forEach(c => D.blocks[c.block].picks = c.to.slice());
+  hist[hpos].forEach(c => applyState(c.block, c.to));
   const b = hist[hpos][0].block;
   hpos++;
   if (diffIds.includes(b)) cur = diffIds.indexOf(b);
@@ -571,7 +599,7 @@ function autoMerge(){
   for (const id of diffIds) {
     const a = D.blocks[id].auto;
     if (!a) continue;
-    ch.push({block:id, from: picksOf(id).slice(), to: a.slice()});
+    ch.push({block: id, from: snap(id), to: {picks: a.slice(), manual: null}});
   }
   step(ch);
 }
@@ -604,24 +632,36 @@ function rowsForUI(){
   let nl = 0, nc = 0, nr = 0;
   for (const blk of D.blocks) {
     if (blk.tag === 'same') {
-      blk.left.forEach((line, k) => {
-        nl++; nc++; nr++;
-        const e = blk.htmlSame[k];
-        rows.push({kind:'same', block:blk.id, nl:nl, nc:nc, nr:nr, l:e, c:e, r:e});
-      });
+      const res = blockLines(blk);
+      const h = Math.max(blk.left.length, res.length, 1);
+      for (let i = 0; i < h; i++) {
+        const row = {kind:'same', block:blk.id, nl:null, nc:null, nr:null,
+                     l:'', c:'', r:'', cf:null};
+        if (i < blk.left.length) {
+          nl++; nr++;
+          row.nl = nl; row.nr = nr;
+          row.l = blk.htmlSame[i]; row.r = blk.htmlSame[i];
+        }
+        if (i < res.length) { nc++; row.nc = nc; row.c = esc(res[i]); }
+        rows.push(row);
+      }
       continue;
     }
     const res = [], from = [];
     for (const s of (blk.picks || [])) {
       for (const line of (s === 'left' ? blk.left : blk.right)) { res.push(line); from.push(s); }
     }
-    const h = Math.max(blk.pairs.length, res.length, 1);
+    const lines = blk.manual || res;
+    const h = Math.max(blk.pairs.length, lines.length, 1);
     for (let i = 0; i < h; i++) {
       const p = blk.pairs[i] || [null, null, '', ''];
       const row = {kind:'diff', block:blk.id, nl:null, nc:null, nr:null, l:'', c:'', r:'', cf:null};
       if (p[0] !== null) { nl++; row.nl = nl; row.l = p[2]; }
       if (p[1] !== null) { nr++; row.nr = nr; row.r = p[3]; }
-      if (i < res.length) { nc++; row.nc = nc; row.c = esc(res[i]); row.cf = from[i]; }
+      if (i < lines.length) {
+        nc++; row.nc = nc; row.c = esc(lines[i]);
+        row.cf = blk.manual ? null : from[i];
+      }
       rows.push(row);
     }
   }
@@ -645,14 +685,22 @@ function render(){
     const cl = cell('code l' + m + (r.nl === null ? ' empty' : ''), r.l);
     const gl = cell('gut gl' + (isDiff ? ' d' : ''));
     const nc = cell('ln c' + m, r.nc === null ? '' : String(r.nc));
+    const manualBlk = MERGE && !!D.blocks[r.block].manual;
     const cc = cell('code c' + m + (r.nc === null ? ' empty' : '')
-                    + (r.cf === 'left' ? ' fromL' : r.cf === 'right' ? ' fromR' : ''), r.c);
+                    + (manualBlk ? ' man' : '')
+                    + (r.cf === 'left' ? ' fromL' : r.cf === 'right' ? ' fromR' : '')
+                    + (MERGE ? ' edit' : ''), r.c);
     if (r.cf) cc.title = 'источник: ' + (r.cf === 'left' ? D.leftName : D.rightName);
+    if (manualBlk) cc.title = 'изменено вручную';
+    if (MERGE) {
+      cc.dataset.b = r.block;
+      cc.ondblclick = e => { e.stopPropagation(); startEdit(r.block); };
+    }
     const gr = cell('gut gr' + (isDiff ? ' d' : ''));
     const nr = cell('ln r' + m, r.nr === null ? '' : String(r.nr));
     const cr = cell('code r' + m + (r.nr === null ? ' empty' : ''), r.r);
     if (isDiff) {
-      cl.dataset.b = r.block; cc.dataset.b = r.block; cr.dataset.b = r.block;
+      cl.dataset.b = r.block; cr.dataset.b = r.block;
       if (r.nl === null) cl.dataset.filler = '1';
       if (r.nc === null) cc.dataset.filler = '1';
       if (r.nr === null) cr.dataset.filler = '1';
@@ -714,7 +762,70 @@ function render(){
     [nl, cl, gl, nc, cc, gr, nr, cr].forEach(e => g.appendChild(e));
   });
   ribbons(); ruler(); status();
-  if (!manual) document.getElementById('rtext').value = mergedLines().join('\n');
+  if (editing !== null) placeEditor();
+}
+// ------------------------------------------------ правка результата на месте
+// Поле кладём поверх центральной колонки ровно на высоту участка: правка идёт
+// в самом результате, а панели не разъезжаются.
+function startEdit(id){
+  if (!MERGE) return;
+  if (editing !== null && editing !== id) { commitEdit(); }
+  editing = id;
+  if (diffIds.includes(id)) cur = diffIds.indexOf(id);
+  render();
+  const ta = document.getElementById('blockedit');
+  if (ta) { ta.focus(); ta.setSelectionRange(ta.value.length, ta.value.length); }
+}
+function commitEdit(){
+  const ta = document.getElementById('blockedit');
+  const id = editing;
+  editing = null;
+  if (ta && id !== null) {
+    const lines = ta.value.split('\n');
+    if (lines.length > 1 && lines[lines.length - 1] === '') lines.pop();
+    const before = hist.length;
+    setManual(id, lines);
+    if (hist.length === before) render();   // ничего не изменилось — просто закрыть
+  } else {
+    render();
+  }
+}
+function cancelEdit(){ editing = null; render(); }
+function editCurrent(){
+  if (!MERGE || !diffIds.length) return;
+  startEdit(editing !== null ? editing : diffIds[cur]);
+}
+function placeEditor(){
+  const g = document.getElementById('grid');
+  const cells = [...g.querySelectorAll('.code.c[data-b="' + editing + '"]')];
+  if (!cells.length) { editing = null; return; }
+  const first = cells[0], last = cells[cells.length - 1];
+  const top = first.offsetTop, bottom = last.offsetTop + last.offsetHeight;
+  const hint = document.createElement('div');
+  hint.id = 'edithint';
+  hint.textContent = 'правка результата · \u2318\u23ce применить · Esc отменить';
+  hint.style.left = first.offsetLeft + 'px';
+  hint.style.top = top + 'px';
+  g.appendChild(hint);
+  const ta = document.createElement('textarea');
+  ta.id = 'blockedit';
+  ta.spellcheck = false;
+  ta.value = blockLines(D.blocks[editing]).join('\n');
+  ta.style.left = first.offsetLeft + 'px';
+  ta.style.top = top + 'px';
+  ta.style.width = first.offsetWidth + 'px';
+  const minH = Math.max(bottom - top, 24);
+  ta.style.height = minH + 'px';
+  const grow = () => { ta.style.height = minH + 'px';
+                       ta.style.height = Math.max(ta.scrollHeight, minH) + 'px'; };
+  ta.oninput = grow;
+  ta.onblur = () => commitEdit();
+  ta.onkeydown = e => {
+    if (e.key === 'Escape') { e.preventDefault(); ta.onblur = null; cancelEdit(); return; }
+    if (e.key === 'Enter' && (e.metaKey || e.ctrlKey)) { e.preventDefault(); ta.blur(); return; }
+    e.stopPropagation();
+  };
+  g.appendChild(ta);
 }
 function ribbons(){
   const g = document.getElementById('grid');
@@ -806,16 +917,11 @@ function jump(d){
   cur = (cur + d + diffIds.length) % diffIds.length;
   render(); focusCur();
 }
-function toggleEdit(){
-  editing = !editing;
-  document.getElementById('edit').style.display = editing ? 'block' : 'none';
-  document.getElementById('editbtn').textContent =
-    editing ? 'Вернуться к слиянию' : (manual ? 'Править вручную · изменён' : 'Править вручную');
-  if (editing && !manual) document.getElementById('rtext').value = mergedLines().join('\n');
-}
 function send(action){
+  if (editing !== null) commitEdit();
   const body = {action, picks: D.blocks.map(b => b.picks || [])};
-  if (MERGE) body.text = document.getElementById('rtext').value;
+  // Текст собираем из того, что видно в центре: ручные правки уже внутри.
+  if (MERGE) body.text = mergedLines().join('\n');
   fetch('/apply', {method:'POST', headers:{'Content-Type':'application/json'},
                    body: JSON.stringify(body)})
    .then(r => r.text()).then(t => {
@@ -824,12 +930,9 @@ function send(action){
        + t.replace(/</g,'&lt;') + '<br><br><span style="color:#8f9196">Окно можно закрыть.</span></div>';
    });
 }
-document.getElementById('rtext').addEventListener('input', () => {
-  manual = true;
-  document.getElementById('editbtn').textContent = 'Вернуться к слиянию · изменён вручную';
-});
 document.addEventListener('keydown', e => {
-  if (e.target && e.target.id === 'rtext') return;
+  if (e.target && e.target.id === 'blockedit') return;
+  if (e.key === 'F2' && MERGE) { editCurrent(); e.preventDefault(); return; }
   if ((e.metaKey || e.ctrlKey) && e.key.toLowerCase() === 'z') {
     e.shiftKey ? redo() : undo(); e.preventDefault(); return;
   }

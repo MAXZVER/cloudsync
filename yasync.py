@@ -22,7 +22,8 @@ BACKEND_FLAGS, и там сейчас одна строка.
   status                         что настроено и когда синхронизировалось
   state                          то же одной строкой JSON — для приложения
   conflicts                      список конфликтов
-  resolve [имя|номер]            открыть слияние конфликта в браузере
+  resolve [имя|номер] [--port N] [--no-browser]
+                                 открыть слияние конфликта в браузере
 """
 import json
 import os
@@ -558,6 +559,13 @@ def cmd_resolve(args):
     sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
     import yadiff
 
+    want_port = 0
+    for a in list(args):
+        if a.startswith("--port"):
+            want_port = int(a.split("=", 1)[1]) if "=" in a else int(args[args.index(a) + 1])
+    no_browser = "--no-browser" in args
+    args = [a for a in args if not a.startswith("--") and not a.isdigit()]
+
     cfg = load()
     conflicts = find_conflicts(cfg)
     if not conflicts:
@@ -636,17 +644,21 @@ def cmd_resolve(args):
             self.wfile.write(out)
             result["done"] = True
 
+    # Порт по умолчанию свободный случайный. Фиксированный нужен, когда страницу
+    # смотрят через туннель и адрес не должен меняться от запуска к запуску.
     s = socket.socket()
-    s.bind(("127.0.0.1", 0))
+    s.bind(("127.0.0.1", want_port))
     port = s.getsockname()[1]
     s.close()
     srv = http.server.HTTPServer(("127.0.0.1", port), Handler)
+    srv.allow_reuse_address = True
     threading.Thread(target=srv.serve_forever, daemon=True).start()
     url = "http://127.0.0.1:%d/" % port
     print("  конфликт: %s / %s" % (c["folder"], c["base"]), flush=True)
     print("  слияние открыто: %s" % url, flush=True)
     print("  окно можно закрыть после применения", flush=True)
-    webbrowser.open(url)
+    if not no_browser:
+        webbrowser.open(url)
     try:
         while not result["done"]:
             time.sleep(0.3)
