@@ -85,8 +85,11 @@ BACKEND_NAMES = {
 
 # Суффиксы проигравших при конфликте. С --conflict-resolve none rclone оставляет
 # ОБЕ версии, переименовав их — это и есть вход для нашего диффа.
-CONFLICT_LOCAL = "local"
-CONFLICT_REMOTE = "remote"
+CONFLICT_LOCAL = "cloudsync-local"
+CONFLICT_REMOTE = "cloudsync-remote"
+# Суффиксы прежних версий тоже узнаём, чтобы уже возникшие конфликты не потерялись.
+LEGACY_SUFFIXES = [("local", "remote")]
+ALL_SUFFIXES = [(CONFLICT_LOCAL, CONFLICT_REMOTE)] + LEGACY_SUFFIXES
 
 # Снимок содержимого на момент последней удачной синхронизации — общий предок.
 # Без него две разошедшиеся версии неразличимы: строка есть слева и нет справа —
@@ -94,7 +97,15 @@ CONFLICT_REMOTE = "remote"
 # С предком они делятся точно, и автослияние становится честным.
 BASEDIR = os.path.join(SUPPORT, "base")
 BASE_MAX = 32 * 1024 * 1024   # большие файлы не копируем: их всё равно не сливают построчно
-SKIP_SUFFIX = ("." + CONFLICT_LOCAL, "." + CONFLICT_REMOTE)
+LF_STR = chr(10)
+CRLF_STR = chr(13) + chr(10)
+SKIP_SUFFIX = tuple("." + x for pair in ALL_SUFFIXES for x in pair)
+
+
+# ПРОВЕРЕНО И ОТВЕРГНУТО: исключать служебные копии через --filters-file
+# бесполезно. Bisync заносит в свой список файлы, которые сам же создал при
+# разрешении конфликта, независимо от фильтров — это видно в его .lst. Зато
+# исключение задело бы настоящие пользовательские файлы с такими окончаниями.
 
 
 def log(msg):
@@ -347,9 +358,11 @@ def snapshot(cfg, folder):
             if n.endswith(SKIP_SUFFIX) or n.startswith("."):
                 # Файл в конфликте: самого его нет, есть две версии. Именно для
                 # него старый снимок и нужен — не трогаем его.
-                if n.endswith("." + CONFLICT_LOCAL):
-                    keep.add(os.path.relpath(
-                        os.path.join(dirpath, n[: -(len(CONFLICT_LOCAL) + 1)]), root))
+                for mine, _ in ALL_SUFFIXES:
+                    if n.endswith("." + mine):
+                        keep.add(os.path.relpath(
+                            os.path.join(dirpath, n[: -(len(mine) + 1)]), root))
+                        break
                 continue
             src = os.path.join(dirpath, n)
             try:
@@ -489,16 +502,20 @@ def find_conflicts(cfg, folder=None):
         root = local_path(cfg, f["remote"])
         for dirpath, _, names in os.walk(root):
             for n in names:
-                if n.endswith("." + CONFLICT_LOCAL):
-                    base = n[: -(len(CONFLICT_LOCAL) + 1)]
-                    other = os.path.join(dirpath, base + "." + CONFLICT_REMOTE)
+                for mine, theirs in ALL_SUFFIXES:
+                    if not n.endswith("." + mine):
+                        continue
+                    base = n[: -(len(mine) + 1)]
+                    other = os.path.join(dirpath, base + "." + theirs)
                     if os.path.exists(other):
                         out.append({
                             "folder": f["remote"],
                             "base": os.path.relpath(os.path.join(dirpath, base), root),
                             "local": os.path.join(dirpath, n),
                             "remote": other,
+                            "suffixes": (mine, theirs),
                         })
+                    break
     return out
 
 
@@ -705,6 +722,20 @@ def cmd_resolve(args):
     return 0
 
 
+def newline_of(path):
+    """Какими переводами строк написан файл.
+
+    Писать результат «как принято в этой ОС» нельзя: файл ходит между машинами,
+    и смена переводов строк выглядит на той стороне как изменение каждой строки.
+    """
+    try:
+        with open(path, "rb") as f:
+            head = f.read(65536)
+    except OSError:
+        return LF_STR
+    return CRLF_STR if CRLF_STR.encode() in head else LF_STR
+
+
 def apply_resolution(cfg, c, blocks, data, mergeable):
     """Записывает результат выбора и запускает синхронизацию."""
     sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
@@ -718,21 +749,25 @@ def apply_resolution(cfg, c, blocks, data, mergeable):
     for b, p in zip(blocks, picks):
         b["picks"] = list(p)
 
+    mine, theirs = c.get("suffixes", (CONFLICT_LOCAL, CONFLICT_REMOTE))
     base = os.path.join(os.path.dirname(c["local"]),
-                        os.path.basename(c["local"])[: -len("." + CONFLICT_LOCAL)])
+                        os.path.basename(c["local"])[: -(len(mine) + 1)])
     if mergeable:
         # Если пользователь правил результат руками — его текст главнее выбора блоков.
         text = data.get("text")
+        nl = newline_of(c["local"])
         if text is None:
             merged = yadiff.render_merged(blocks)
-            text = "\n".join(merged) + ("\n" if merged else "")
             what = "слито %d строк" % len(merged)
         else:
-            if text and not text.endswith("\n"):
-                text += "\n"
-            what = "сохранено %d строк" % text.count("\n")
-        with open(base, "w", encoding="utf-8") as f:
-            f.write(text)
+            merged = text.split(LF_STR)
+            if merged and merged[-1] == "":
+                merged.pop()
+            what = "сохранено %d строк" % len(merged)
+        body = nl.join(merged) + (nl if merged else "")
+        # newline="" — иначе Python на Windows подменит переводы строк своими.
+        with open(base, "w", encoding="utf-8", newline="") as f:
+            f.write(body)
     else:
         # Офисный или двоичный файл: построчно не собрать, берём сторону целиком.
         # Слева — хранилище, справа — эта машина.
@@ -746,14 +781,34 @@ def apply_resolution(cfg, c, blocks, data, mergeable):
 
     os.remove(c["local"])
     os.remove(c["remote"])
+
+    # Проигравшие копии rclone создал и на стороне хранилища. Если оставить их
+    # там, следующая синхронизация должна будет удалить две и добавить одну — на
+    # небольшой папке это «изменилось почти всё», и срабатывает страховка.
+    # Удаляем их адресно: мы точно знаем, что это за файлы и что они больше не
+    # нужны. Это не обход страховки, а устранение причины ложного срабатывания.
+    rel = c["base"].replace(os.sep, "/")
+    for suffix in (mine, theirs):
+        target = "%s%s/%s.%s" % (cfg["remote"], c["folder"], rel, suffix)
+        rc, _, err = run(["deletefile", target, "--timeout", "60s"], timeout=300)
+        if rc != 0 and "not found" not in (err or "").lower():
+            log("не удалось убрать %s: %s" % (target, (err or "").strip().splitlines()[-1:]))
     log("конфликт разрешён: %s/%s — %s" % (c["folder"], c["base"], what))
 
     folder = next((f for f in cfg["folders"] if f["remote"] == c["folder"]), None)
-    if folder:
-        do_sync(cfg, folder)
+    rc = do_sync(cfg, folder) if folder else 0
     left = len(find_conflicts(cfg))
-    return "Готово: %s. Синхронизировано.%s" % (
-        what, ("  Осталось конфликтов: %d" % left) if left else "  Конфликтов больше нет.")
+    tail = ("  Осталось конфликтов: %d" % left) if left else "  Конфликтов больше нет."
+    # Не рапортуем об успехе, которого не было: sync мог остановиться страховкой
+    # или не дойти до хранилища.
+    if rc == 2:
+        return ("Файл собран и сохранён (%s), но синхронизация остановлена страховкой: %s. "
+                "Результат лежит локально; чтобы отправить его в хранилище, подтвердите "
+                "массовое изменение в меню." % (what, folder.get("lastReason", "")))
+    if rc != 0:
+        return ("Файл собран и сохранён (%s), но синхронизация не удалась — смотрите журнал. "
+                "Результат лежит локально.%s" % (what, tail))
+    return "Готово: %s. Синхронизировано.%s" % (what, tail)
 
 
 COMMANDS["resolve"] = cmd_resolve
