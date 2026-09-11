@@ -1,18 +1,23 @@
-# yasync — Yandex.Disk sync for macOS that does not run all day
+# yasync — selective cloud sync for macOS that does not run all day
 
 > 🇷🇺 [Русская версия](README.ru.md)
 
-A selective-folder Yandex.Disk client for macOS in three files, with a real three-way merge for
-conflicts — including Office documents. It has no resident daemon and no polling loop: it sleeps
-until the kernel wakes it.
+Pick folders from a cloud storage and keep them in sync, in three files, with a real three-way merge
+for conflicts — including Office documents. No resident daemon and no polling loop: it sleeps until
+the kernel wakes it.
 
-Works on any Mac. Tested on macOS Sequoia 15.7.9.
+**Any provider [rclone](https://rclone.org/overview/) supports** — Yandex.Disk, Google Drive,
+Dropbox, OneDrive, S3, WebDAV, SFTP. The provider is not baked in: you pick one of your configured
+rclone remotes from the menu. Only one line of the code knows about a specific backend, and it is a
+`--yandex-upload-wait` quirk.
+
+Works on any Mac. Built and tested against Yandex.Disk on macOS Sequoia 15.7.9.
 
 | | |
 |---|---|
 | [`yasync.py`](yasync.py) | The engine: config, sync, conflict detection, ancestor snapshots |
 | [`yadiff.py`](yadiff.py) | Three-pane merge UI, served on `127.0.0.1` |
-| [`YandexSync.swift`](YandexSync.swift) | Menu-bar app: folder picker, status, and the decision of *when* to sync |
+| [`CloudSync.swift`](CloudSync.swift) | Menu-bar app: storage and folder picker, status, and the decision of *when* to sync |
 
 Dependencies: [`rclone`](https://rclone.org/) — one static binary — and macOS itself. The Python side
 is standard library only: no `pip`, no virtualenv. The Swift side is one file, built with the Command
@@ -27,17 +32,20 @@ Line Tools; Xcode is not needed.
 mkdir -p ~/bin && curl -fsSL https://downloads.rclone.org/rclone-current-osx-amd64.zip -o /tmp/rc.zip
 unzip -jo /tmp/rc.zip '*/rclone' -d ~/bin && chmod +x ~/bin/rclone
 
-# authorise the remote — opens a browser; the token stays in ~/.config/rclone/rclone.conf
-~/bin/rclone config create yandex yandex
+# set up a remote if you have none — rclone asks the questions and keeps the token
+~/bin/rclone config
 
 cp yasync.py yadiff.py ~/bin/ && chmod +x ~/bin/yasync.py
-~/bin/yasync.py init
+~/bin/yasync.py remotes          # what rclone knows about
+~/bin/yasync.py init yandex:     # or drive:, dropbox:, s3:, …
 
-swiftc -O YandexSync.swift -o ~/bin/YandexSync
-~/bin/YandexSync &
+swiftc -O CloudSync.swift -o ~/bin/CloudSync
+~/bin/CloudSync &
 ```
 
-Pick folders from the menu-bar icon and turn on **Запускать при входе** to keep it there.
+Pick the storage and the folders from the menu-bar icon, and turn on **Запускать при входе** to
+keep it there. The local root defaults to `~/<StorageName>` and is recorded in the config, so it
+never moves under folders that are already syncing.
 
 The OAuth token lives in rclone's own config file. Nothing here reads, copies or logs it.
 
@@ -52,7 +60,7 @@ No timer, no polling loop. The app is idle until the kernel wakes it, and exactl
 
 | Trigger | Mechanism | Why |
 |---|---|---|
-| A file changed locally | `FSEventStream` on `~/YandexDisk`, 2 s kernel coalescing + 10 s debounce | Push from the kernel. A burst of saves costs one sync |
+| A file changed locally | `FSEventStream` on the sync root, 2 s kernel coalescing + 10 s debounce | Push from the kernel. A burst of saves costs one sync |
 | Finder became active | `NSWorkspace.didActivateApplicationNotification`, throttled to once per 2 min | The closest thing macOS has to "the user opened a folder" |
 | Woke from sleep | `NSWorkspace.didWakeNotification` | The remote has probably moved on while the lid was shut |
 | Network came back | `NWPathMonitor`, only after it had been down | Retry the sync that failed offline, once, when it can succeed |
@@ -96,7 +104,7 @@ Passing `--force` automatically would make the tool convenient and occasionally 
 ## Conflicts: a real three-way merge
 
 Open a conflict from the menu and a local HTTP server on `127.0.0.1` (random port) serves a merge
-page: **left is Yandex.Disk, right is this Mac, the middle pane is the live result.**
+page: **left is the storage, right is this Mac, the middle pane is the live result.**
 
 - The chevron in a gutter points **inward** to take a hunk into the result, and flips **outward**
   once it is there, so one click puts it back.
@@ -117,7 +125,7 @@ anywhere on disk.
 Only a third version — the common ancestor — separates those cases.
 
 So `yasync.py` keeps one. After every successful sync, when both sides agree by definition, it
-snapshots the folder into `~/Library/Application Support/YandexSync/base/`: gzipped, incremental (a
+snapshots the folder into `~/Library/Application Support/CloudSync/base/`: gzipped, incremental (a
 file is re-copied only if its size or mtime changed), skipping anything over 32 MB. Files currently
 in conflict are deliberately *not* re-snapshotted — their old ancestor is exactly what the merge
 needs.
@@ -156,17 +164,19 @@ The page says so instead of offering buttons that would produce a corrupt docume
 
 | Path | What |
 |---|---|
-| `~/YandexDisk/` | The synced folders themselves |
-| `~/Library/Application Support/YandexSync/config.json` | Which folders, when each last synced |
-| `~/Library/Application Support/YandexSync/bisync/` | `rclone bisync` state |
-| `~/Library/Application Support/YandexSync/base/` | Gzipped ancestor snapshots |
-| `~/Library/Logs/yandex-sync.log` | Log |
+| `~/<StorageName>/` | The synced folders themselves |
+| `~/Library/Application Support/CloudSync/config.json` | Which storage, which folders, when each last synced |
+| `~/Library/Application Support/CloudSync/bisync/` | `rclone bisync` state |
+| `~/Library/Application Support/CloudSync/base/` | Gzipped ancestor snapshots |
+| `~/Library/Logs/cloud-sync.log` | Log |
 | `~/.config/rclone/rclone.conf` | The OAuth token — rclone's, not ours |
 
 The engine is usable on its own:
 
 ```bash
-yasync.py ls                  # folders on the Disk
+yasync.py remotes             # storages rclone knows about
+yasync.py init drive:         # choose one
+yasync.py ls                  # folders in it
 yasync.py add Документы       # take one under sync (first run does a resync)
 yasync.py sync --all
 yasync.py status              # or: state, for JSON
@@ -187,8 +197,9 @@ yasync.py resolve doc.txt     # opens the merge page
 - **Finder activation is a proxy**, not a real "folder opened" signal — see above.
 - **Case sensitivity and extended attributes** are `rclone`'s business, not ours; Finder tags and
   resource forks do not survive a round trip.
-- **This is not a Yandex product** and is not affiliated with Yandex. It talks to the Disk through
-  rclone's public API support.
+- **Not affiliated with any of the storage providers.** All network work is `rclone`'s.
+- **Only one backend quirk is handled** (`--yandex-upload-wait`). Another provider may need its own;
+  that is one line in `BACKEND_FLAGS`.
 
 ## License
 

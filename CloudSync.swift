@@ -1,8 +1,9 @@
-// Яндекс.Диск: приложение в строке меню.
+// Облачная синхронизация: приложение в строке меню.
 //
-// Сборка:  swiftc -O YandexSync.swift -o ~/bin/YandexSync
+// Сборка:  swiftc -O CloudSync.swift -o ~/bin/CloudSync
 //
-// Вся работа — в yasync.py; здесь только выбор папок и решение, КОГДА запускать.
+// Вся работа — в yasync.py; здесь только выбор хранилища и папок и решение,
+// КОГДА запускать. Конкретный провайдер тут не зашит: имя берётся из конфига.
 //
 // Про батарею. Ни одного цикла опроса: приложение спит, пока ядро его не
 // разбудит. Источники пробуждения ровно четыре:
@@ -18,7 +19,8 @@ import Network
 
 let HOME = NSHomeDirectory()
 let YASYNC = HOME + "/bin/yasync.py"
-let AGENT = HOME + "/Library/LaunchAgents/com.local.yandexsync.plist"
+let AGENT_ID = "com.local.cloudsync"
+let AGENT = HOME + "/Library/LaunchAgents/" + AGENT_ID + ".plist"
 
 // Finder открывают часто, а синхронизация — сетевой запрос. Не чаще раза в 2 минуты.
 let FINDER_THROTTLE: TimeInterval = 120
@@ -56,8 +58,15 @@ struct ConflictRef: Codable { let folder: String; let file: String }
 struct SyncState: Codable {
     let root: String
     let log: String
+    let remote: String
+    let label: String
     let folders: [FolderState]
     let conflicts: [ConflictRef]
+}
+struct RemoteEntry: Codable {
+    let remote: String
+    let type: String
+    let label: String
 }
 struct RemoteItem: Codable {
     let name: String
@@ -69,6 +78,12 @@ struct RemoteListing: Codable {
     let path: String
     let items: [RemoteItem]?
     let error: String?
+}
+
+func loadRemotes() -> [RemoteEntry] {
+    let r = yasync(["remotes", "--json"])
+    guard r.code == 0, let d = r.out.data(using: .utf8) else { return [] }
+    return (try? JSONDecoder().decode([RemoteEntry].self, from: d)) ?? []
 }
 
 func loadState() -> SyncState? {
@@ -119,18 +134,22 @@ final class Watcher {
 // ------------------------------------------------------------ выбор папок
 final class PickerWindow: NSWindowController, NSTableViewDataSource, NSTableViewDelegate {
     private let table = NSTableView()
-    private let pathLabel = NSTextField(labelWithString: "Яндекс.Диск")
+    private let pathLabel = NSTextField(labelWithString: "")
     private let spinner = NSProgressIndicator()
     private var items: [RemoteItem] = []
     private var path = ""
     private let onChanged: () -> Void
+    private let store: String
+    private let root: String
 
-    init(onChanged: @escaping () -> Void) {
+    init(store: String, root: String, onChanged: @escaping () -> Void) {
+        self.store = store
+        self.root = root
         self.onChanged = onChanged
         let w = NSWindow(contentRect: NSRect(x: 0, y: 0, width: 460, height: 420),
                          styleMask: [.titled, .closable, .resizable],
                          backing: .buffered, defer: false)
-        w.title = "Папки Яндекс.Диска"
+        w.title = "Папки: " + store
         w.center()
         super.init(window: w)
         build()
@@ -165,7 +184,7 @@ final class PickerWindow: NSWindowController, NSTableViewDataSource, NSTableView
         scroll.hasVerticalScroller = true
 
         let hint = NSTextField(wrappingLabelWithString:
-            "Галочка — папка синхронизируется целиком в \(HOME)/YandexDisk. " +
+            "Галочка — папка синхронизируется целиком в \(root). " +
             "Первая синхронизация может занять время. Снятие галочки останавливает " +
             "синхронизацию, локальные файлы остаются на месте.")
         hint.font = .systemFont(ofSize: 11)
@@ -181,7 +200,7 @@ final class PickerWindow: NSWindowController, NSTableViewDataSource, NSTableView
 
     private func reload(_ p: String) {
         path = p
-        pathLabel.stringValue = p.isEmpty ? "Яндекс.Диск" : "Яндекс.Диск / " + p
+        pathLabel.stringValue = p.isEmpty ? store : store + " / " + p
         spinner.startAnimation(nil)
         DispatchQueue.global().async {
             let r = yasync(["ls", p, "--json"])
@@ -191,7 +210,7 @@ final class PickerWindow: NSWindowController, NSTableViewDataSource, NSTableView
             DispatchQueue.main.async {
                 self.spinner.stopAnimation(nil)
                 if let err = listing?.error {
-                    self.pathLabel.stringValue = "Не удалось прочитать Диск: " + err
+                    self.pathLabel.stringValue = "Не удалось прочитать хранилище: " + err
                 }
                 self.items = listing?.items ?? []
                 self.table.reloadData()
@@ -260,6 +279,7 @@ final class App: NSObject, NSApplicationDelegate, NSMenuDelegate {
     private var lastFinderRun = Date.distantPast
     private var pendingEdit: DispatchWorkItem?
     private var netMonitor: NWPathMonitor?
+    private var remotes: [RemoteEntry] = []
     private var netWasDown = false
 
     func applicationDidFinishLaunching(_ n: Notification) {
@@ -283,6 +303,10 @@ final class App: NSObject, NSApplicationDelegate, NSMenuDelegate {
     private func updateIcon() {
         if syncing { setIcon("arrow.triangle.2.circlepath", "Синхронизация…"); return }
         let s = state
+        if s?.remote.isEmpty ?? true {
+            setIcon("questionmark.circle", "Хранилище не выбрано")
+            return
+        }
         let conflicts = s?.conflicts.count ?? 0
         let bad = s?.folders.contains { ($0.lastResult ?? "") != "ok" } ?? false
         if conflicts > 0 {
@@ -290,7 +314,7 @@ final class App: NSObject, NSApplicationDelegate, NSMenuDelegate {
         } else if bad {
             setIcon("xmark.icloud", "Последняя синхронизация не удалась")
         } else {
-            setIcon("icloud", "Яндекс.Диск синхронизирован")
+            setIcon("icloud", (s?.label ?? "Хранилище") + " синхронизировано")
         }
     }
 
@@ -322,7 +346,8 @@ final class App: NSObject, NSApplicationDelegate, NSMenuDelegate {
             menu.addItem(disabled(last.map { "Синхронизировано: " + pretty($0) }
                                   ?? "Ещё ни разу не синхронизировано"))
         } else {
-            menu.addItem(disabled("Ни одной папки не выбрано"))
+            menu.addItem(disabled((s?.remote.isEmpty ?? true)
+                                  ? "Хранилище не выбрано" : "Ни одной папки не выбрано"))
         }
         menu.addItem(.separator())
 
@@ -368,7 +393,30 @@ final class App: NSObject, NSApplicationDelegate, NSMenuDelegate {
             menu.addItem(mi)
         }
 
-        add(menu, "Выбрать папки…", #selector(openPicker))
+        let store = NSMenuItem(title: (s?.label.isEmpty == false)
+                               ? "Хранилище: " + s!.label : "Выбрать хранилище…",
+                               action: nil, keyEquivalent: "")
+        if remotes.isEmpty { remotes = loadRemotes() }
+        let storeMenu = NSMenu()
+        if remotes.isEmpty {
+            storeMenu.addItem(disabled("rclone не знает ни одного хранилища"))
+            storeMenu.addItem(disabled("Заведите его командой  rclone config"))
+        }
+        for r in remotes {
+            let mi = NSMenuItem(title: r.label + "  (" + r.remote + ")",
+                                action: #selector(pickRemote(_:)), keyEquivalent: "")
+            mi.target = self
+            mi.representedObject = r.remote
+            mi.state = (r.remote == s?.remote) ? .on : .off
+            storeMenu.addItem(mi)
+        }
+        store.submenu = storeMenu
+        menu.addItem(store)
+        let pick = NSMenuItem(title: "Выбрать папки…", action: #selector(openPicker),
+                              keyEquivalent: "")
+        pick.target = self
+        pick.isEnabled = !(s?.remote.isEmpty ?? true)
+        menu.addItem(pick)
         add(menu, "Синхронизировать всё", #selector(syncAll))
         menu.addItem(.separator())
         add(menu, "Открыть папку", #selector(openRoot))
@@ -417,8 +465,25 @@ final class App: NSObject, NSApplicationDelegate, NSMenuDelegate {
     }
 
     // ------------------------------------------------------------ действия
+    @objc private func pickRemote(_ s: NSMenuItem) {
+        guard let r = s.representedObject as? String else { return }
+        syncing = true; updateIcon()
+        queue.async {
+            yasync(["init", r])
+            DispatchQueue.main.async {
+                self.syncing = false
+                self.picker?.close(); self.picker = nil
+                self.remotes = []
+                self.refresh(then: { self.startWatching() })
+            }
+        }
+    }
     @objc private func openPicker() {
-        if picker == nil { picker = PickerWindow(onChanged: { self.refresh() }) }
+        guard let st = state, !st.remote.isEmpty else { return }
+        if picker == nil {
+            picker = PickerWindow(store: st.label, root: st.root,
+                                  onChanged: { self.refresh() })
+        }
         NSApp.activate(ignoringOtherApps: true)
         picker?.showWindow(nil)
         picker?.window?.makeKeyAndOrderFront(nil)
@@ -450,24 +515,24 @@ final class App: NSObject, NSApplicationDelegate, NSMenuDelegate {
         }
     }
     @objc private func openRoot() {
-        NSWorkspace.shared.open(URL(fileURLWithPath: state?.root ?? HOME + "/YandexDisk"))
+        NSWorkspace.shared.open(URL(fileURLWithPath: state?.root ?? HOME))
     }
     @objc private func openLog() {
         NSWorkspace.shared.open(URL(fileURLWithPath: state?.log
-            ?? HOME + "/Library/Logs/yandex-sync.log"))
+            ?? HOME + "/Library/Logs/cloud-sync.log"))
     }
     @objc private func toggleAgent() {
         let fm = FileManager.default
         if fm.fileExists(atPath: AGENT) {
             _ = try? fm.removeItem(atPath: AGENT)
-            shell("/bin/launchctl", ["bootout", "gui/\(getuid())/com.local.yandexsync"])
+            shell("/bin/launchctl", ["bootout", "gui/\(getuid())/" + AGENT_ID])
         } else {
-            let exe = Bundle.main.executablePath ?? (HOME + "/bin/YandexSync")
+            let exe = Bundle.main.executablePath ?? (HOME + "/bin/CloudSync")
             let plist = """
             <?xml version="1.0" encoding="UTF-8"?>
             <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
             <plist version="1.0"><dict>
-              <key>Label</key><string>com.local.yandexsync</string>
+              <key>Label</key><string>\(AGENT_ID)</string>
               <key>ProgramArguments</key><array><string>\(exe)</string></array>
               <key>RunAtLoad</key><true/>
             </dict></plist>
@@ -507,7 +572,7 @@ final class App: NSObject, NSApplicationDelegate, NSMenuDelegate {
     }
 
     private func startWatching() {
-        let root = state?.root ?? HOME + "/YandexDisk"
+        guard let root = state?.root, !root.isEmpty else { return }
         try? FileManager.default.createDirectory(atPath: root, withIntermediateDirectories: true)
         watcher = Watcher(path: root) { [weak self] paths in
             self?.filesChanged(paths)

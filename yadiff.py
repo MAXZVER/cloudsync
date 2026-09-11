@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """Разрешение конфликтов: три панели, как в IDE.
 
-Слева — версия с Яндекс.Диска, справа — версия с этого Mac, посередине живой
+Слева — версия из хранилища, справа — версия с этого Mac, посередине живой
 результат. Шевроны в жёлобах добавляют сторону в результат; порядок нажатия
 задаёт порядок строк, поэтому «сначала левое, потом правое» и наоборот
 получаются без отдельных кнопок.
@@ -647,7 +647,7 @@ function render(){
     const nc = cell('ln c' + m, r.nc === null ? '' : String(r.nc));
     const cc = cell('code c' + m + (r.nc === null ? ' empty' : '')
                     + (r.cf === 'left' ? ' fromL' : r.cf === 'right' ? ' fromR' : ''), r.c);
-    if (r.cf) cc.title = 'взято ' + (r.cf === 'left' ? 'с Яндекс.Диска' : 'с этого Mac');
+    if (r.cf) cc.title = 'источник: ' + (r.cf === 'left' ? D.leftName : D.rightName);
     const gr = cell('gut gr' + (isDiff ? ' d' : ''));
     const nr = cell('ln r' + m, r.nr === null ? '' : String(r.nr));
     const cr = cell('code r' + m + (r.nr === null ? ' empty' : ''), r.r);
@@ -669,7 +669,7 @@ function render(){
           if (!(side === 'left' ? blk.left.length : blk.right.length)) return;
           const picks = picksOf(r.block);
           const k = picks.indexOf(side), on = k >= 0;
-          const who = side === 'left' ? 'с Яндекс.Диска' : 'с этого Mac';
+          const who = side === 'left' ? D.leftName : D.rightName;
           const inward  = side === 'left' ? ICON.toRight : ICON.toLeft;
           const outward = side === 'left' ? ICON.toLeft  : ICON.toRight;
           const box = document.createElement('div'); box.className = 'acts';
@@ -682,7 +682,7 @@ function render(){
           };
           if (on) {
             // Стрелка развёрнута наружу: этот кусок уже в результате, нажатие его забирает.
-            btn(outward, 'Вернуть назад, убрать из результата: ' + who, 'on',
+            btn(outward, 'Вернуть назад, убрать из результата — ' + who, 'on',
                 () => removeSide(r.block, side));
             if (picks.length > 1) {
               const last = k === picks.length - 1;
@@ -692,10 +692,10 @@ function render(){
                   () => movePick(r.block, side, last ? -1 : 1));
             }
           } else {
-            btn(inward, 'Добавить в результат ' + (picks.length ? 'вниз: ' : ': ') + who, 'dim',
+            btn(inward, 'Добавить в результат' + (picks.length ? ' вниз' : '') + ' — ' + who, 'dim',
                 () => addSide(r.block, side, 'end'));
             if (picks.length) {
-              btn(ICON.up, 'Добавить в результат вверх: ' + who, 'dim',
+              btn(ICON.up, 'Добавить в результат вверх — ' + who, 'dim',
                   () => addSide(r.block, side, 'start'));
             }
           }
@@ -853,7 +853,7 @@ def stamp(path):
                                st.st_size)
 
 
-def page(conflict, blocks, mergeable, reader, three_way=False):
+def page(conflict, blocks, mergeable, reader, three_way=False, remote_label="Хранилище"):
     name = html.escape(os.path.basename(conflict["base"]))
     sub = "%s  ·  читаем как: %s  ·  %s" % (
         html.escape(conflict["folder"]), reader,
@@ -875,8 +875,10 @@ def page(conflict, blocks, mergeable, reader, three_way=False):
                 pairs.append([l, r, hl, hr])
             blk["pairs"] = pairs
     data = {
-        "leftLabel": "Яндекс.Диск  ·  %s" % stamp(conflict["remote"]),
+        "leftLabel": "%s  ·  %s" % (remote_label, stamp(conflict["remote"])),
         "rightLabel": "Этот Mac  ·  %s" % stamp(conflict["local"]),
+        "leftName": remote_label,
+        "rightName": "этот Mac",
         "newer": "left" if os.path.getmtime(conflict["remote"])
                  > os.path.getmtime(conflict["local"]) else "right",
         "threeWay": bool(three_way),

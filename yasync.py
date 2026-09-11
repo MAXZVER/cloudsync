@@ -1,15 +1,20 @@
 #!/usr/bin/env python3
-"""Движок синхронизации Яндекс.Диска. Без зависимостей — только стандартная библиотека.
+"""Движок выборочной синхронизации облака. Без зависимостей — только стандартная библиотека.
 
 Саму синхронизацию делает rclone bisync: он находит изменения с обеих сторон,
 удаления и конфликты. Наша задача — конфигурация, запуск в нужный момент и
 разбор конфликтов.
 
+Провайдер не зашит: берём любой настроенный remote rclone — Яндекс.Диск, Google
+Drive, Dropbox, S3, WebDAV. Всё, что нужно знать про конкретный бэкенд, лежит в
+BACKEND_FLAGS, и там сейчас одна строка.
+
 Важно для батареи: никаких циклов опроса. Скрипт запускается, делает работу и
 завершается. Решение «когда запускать» принимает приложение — по событиям ядра.
 
 Команды:
-  init                           создать корень и конфиг
+  remotes [--json]               какие хранилища настроены в rclone
+  init [remote:]                 выбрать хранилище, создать корень и конфиг
   ls [путь] [--json]             показать папки на Диске
   add <папка>                    взять папку под синхронизацию (первый раз — resync)
   rm <папка>                     снять с синхронизации (локальные файлы остаются)
@@ -27,13 +32,29 @@ import time
 
 HOME = os.path.expanduser("~")
 RCLONE = os.path.join(HOME, "bin", "rclone")
-SUPPORT = os.path.join(HOME, "Library", "Application Support", "YandexSync")
+APPSUP = os.path.join(HOME, "Library", "Application Support")
+SUPPORT = os.path.join(APPSUP, "CloudSync")
+# Установка, сделанная до переименования, продолжает работать со своим каталогом:
+# переносить состояние bisync на ходу опаснее, чем просто его найти.
+if not os.path.exists(SUPPORT) and os.path.exists(os.path.join(APPSUP, "YandexSync")):
+    SUPPORT = os.path.join(APPSUP, "YandexSync")
 CONFIG = os.path.join(SUPPORT, "config.json")
 WORKDIR = os.path.join(SUPPORT, "bisync")
 LOGDIR = os.path.join(HOME, "Library", "Logs")
-LOG = os.path.join(LOGDIR, "yandex-sync.log")
-DEFAULT_ROOT = os.path.join(HOME, "YandexDisk")
-REMOTE = "yandex:"
+LOG = os.path.join(LOGDIR, "cloud-sync.log")
+
+# Единственное место, где вообще упоминается конкретный провайдер. У Яндекса
+# загруженный файл появляется в листинге не мгновенно, и без этой паузы bisync
+# считает его пропавшим. Другим бэкендам добавлять нечего.
+BACKEND_FLAGS = {
+    "yandex": ["--yandex-upload-wait", "2s"],
+}
+# Как называть хранилище в интерфейсе, если по имени remote не догадаться.
+BACKEND_NAMES = {
+    "yandex": "Яндекс.Диск", "drive": "Google Drive", "dropbox": "Dropbox",
+    "onedrive": "OneDrive", "s3": "S3", "webdav": "WebDAV", "sftp": "SFTP",
+    "mailru": "Облако Mail.ru", "box": "Box", "pcloud": "pCloud",
+}
 
 # Суффиксы проигравших при конфликте. С --conflict-resolve none rclone оставляет
 # ОБЕ версии, переименовав их — это и есть вход для нашего диффа.
@@ -57,10 +78,37 @@ def log(msg):
 
 
 def load():
-    if not os.path.exists(CONFIG):
-        return {"remote": REMOTE, "root": DEFAULT_ROOT, "folders": []}
-    with open(CONFIG, encoding="utf-8") as f:
-        return json.load(f)
+    cfg = {"remote": "", "label": "", "root": "", "folders": []}
+    if os.path.exists(CONFIG):
+        with open(CONFIG, encoding="utf-8") as f:
+            cfg.update(json.load(f))
+    if cfg["remote"] and not cfg["label"]:
+        cfg["label"] = nice_name(cfg["remote"])
+    if not cfg["root"]:
+        cfg["root"] = os.path.join(HOME, safe_dir(cfg["label"] or "CloudSync"))
+    return cfg
+
+
+def safe_dir(name):
+    """Имя папки из названия хранилища: без разделителей пути и пробелов."""
+    out = "".join(c for c in name if c not in ("/", "\\", ":"))
+    return out.replace(" ", "") or "CloudSync"
+
+
+def remote_type(remote):
+    """Тип бэкенда по имени remote. Пусто, если rclone о нём не знает."""
+    rc, out, _ = run(["config", "show", remote.rstrip(":")], timeout=30)
+    if rc != 0:
+        return ""
+    for line in out.splitlines():
+        if line.strip().startswith("type"):
+            return line.split("=", 1)[-1].strip()
+    return ""
+
+
+def nice_name(remote):
+    t = remote_type(remote)
+    return BACKEND_NAMES.get(t) or remote.rstrip(":").replace("_", " ").title()
 
 
 def save(cfg):
@@ -81,14 +129,57 @@ def local_path(cfg, remote_folder):
     return os.path.join(cfg["root"], remote_folder.replace("/", os.sep))
 
 
-def cmd_init(_):
+def cmd_remotes(args):
+    """Хранилища, настроенные в самом rclone. Мы их не создаём и токенов не трогаем."""
+    rc, out, err = run(["listremotes"], timeout=60)
+    if rc != 0:
+        print("  rclone не отвечает: %s" % (err.strip().splitlines() or ["?"])[-1])
+        return 1
+    items = []
+    for r in out.split():
+        t = remote_type(r)
+        items.append({"remote": r, "type": t, "label": BACKEND_NAMES.get(t) or nice_name(r)})
+    if "--json" in args:
+        print(json.dumps(items, ensure_ascii=False))
+        return 0
+    if not items:
+        print("  ни одного хранилища не настроено. Заведите его сами:")
+        print("    rclone config")
+        return 1
+    cur = load()["remote"]
+    for it in items:
+        print("  %s %-16s %-12s %s" % ("[+]" if it["remote"] == cur else "[ ]",
+                                       it["remote"], it["type"], it["label"]))
+    return 0
+
+
+def cmd_init(args):
     cfg = load()
+    if args:
+        remote = args[0] if args[0].endswith(":") else args[0] + ":"
+        t = remote_type(remote)
+        if not t:
+            print("  rclone не знает хранилища «%s». Что у него есть:" % remote)
+            return cmd_remotes([])
+        old_root = cfg["root"] if cfg["folders"] else ""
+        cfg["remote"] = remote
+        cfg["label"] = BACKEND_NAMES.get(t) or nice_name(remote)
+        # Корень не двигаем, если по нему уже что-то синхронизируется: там живёт
+        # состояние bisync, и переезд превратил бы всё в «файлы пропали».
+        cfg["root"] = old_root or os.path.join(HOME, safe_dir(cfg["label"]))
+    if not cfg["remote"]:
+        print("  хранилище не выбрано. Доступные:")
+        cmd_remotes([])
+        print("  выберите: yasync.py init <remote>")
+        return 1
     os.makedirs(cfg["root"], exist_ok=True)
     os.makedirs(WORKDIR, exist_ok=True)
     save(cfg)
-    print("  корень:  %s" % cfg["root"])
-    print("  конфиг:  %s" % CONFIG)
+    print("  хранилище: %s  (%s)" % (cfg["label"], cfg["remote"]))
+    print("  корень:    %s" % cfg["root"])
+    print("  конфиг:    %s" % CONFIG)
     print("  папок под синхронизацией: %d" % len(cfg["folders"]))
+    return 0
 
 
 def cmd_ls(args):
@@ -146,9 +237,8 @@ def bisync_args(cfg, folder, resync=False, force=False):
         "--timeout", "60s",
         "--transfers", "4",
         "--checkers", "8",
-        "--yandex-upload-wait", "2s",
         "--log-level", "INFO",
-    ]
+    ] + BACKEND_FLAGS.get(remote_type(cfg["remote"]), [])
     if resync:
         a += ["--resync", "--resync-mode", "newer"]
     if force:
@@ -386,8 +476,9 @@ def cmd_conflicts(_):
     print("  конфликтов: %d" % len(c))
     for x in c:
         print("    %s / %s" % (x["folder"], x["base"]))
-        print("      этот Mac:      %s байт" % os.path.getsize(x["local"]))
-        print("      Яндекс.Диск:   %s байт" % os.path.getsize(x["remote"]))
+        print("      этот Mac:   %s байт" % os.path.getsize(x["local"]))
+        print("      %-11s %s байт" % ((cfg["label"] or "хранилище") + ":",
+                                       os.path.getsize(x["remote"])))
     return 0
 
 
@@ -405,6 +496,7 @@ def folder_size(path):
 
 def cmd_status(_):
     cfg = load()
+    print("  хранилище: %s  (%s)" % (cfg["label"] or "не выбрано", cfg["remote"] or "-"))
     print("  корень: %s" % cfg["root"])
     if not cfg["folders"]:
         print("  папок не выбрано")
@@ -433,14 +525,16 @@ def cmd_state(_):
             "files": files, "bytes": size,
             "conflicts": sum(1 for c in conflicts if c["folder"] == f["remote"]),
         })
-    print(json.dumps({"root": cfg["root"], "log": LOG, "folders": folders,
+    print(json.dumps({"root": cfg["root"], "log": LOG,
+                      "remote": cfg["remote"], "label": cfg["label"],
+                      "folders": folders,
                       "conflicts": [{"folder": c["folder"], "file": c["base"]}
                                     for c in conflicts]}, ensure_ascii=False))
     return 0
 
 
 COMMANDS = {
-    "init": cmd_init, "ls": cmd_ls, "add": cmd_add, "rm": cmd_rm,
+    "remotes": cmd_remotes, "init": cmd_init, "ls": cmd_ls, "add": cmd_add, "rm": cmd_rm,
     "sync": cmd_sync, "status": cmd_status, "state": cmd_state,
     "conflicts": cmd_conflicts,
 }
@@ -515,7 +609,8 @@ def cmd_resolve(args):
 
     blocks = yadiff.build_blocks(left, right, base_lines)
     body = yadiff.page(c, blocks, mergeable, reader,
-                       three_way=base_lines is not None).encode("utf-8")
+                       three_way=base_lines is not None,
+                       remote_label=cfg["label"] or "Хранилище").encode("utf-8")
     result = {"done": False}
 
     class Handler(http.server.BaseHTTPRequestHandler):
@@ -592,13 +687,14 @@ def apply_resolution(cfg, c, blocks, data, mergeable):
             f.write(text)
     else:
         # Офисный или двоичный файл: построчно не собрать, берём сторону целиком.
-        # Слева — сервер, справа — эта машина.
+        # Слева — хранилище, справа — эта машина.
         chosen = [s for b in blocks if b["tag"] == "diff" for s in b.get("picks", [])]
         side = "left" if chosen and all(s == "left" for s in chosen) else "right"
         src = c["remote"] if side == "left" else c["local"]
         with open(src, "rb") as a, open(base, "wb") as b2:
             b2.write(a.read())
-        what = "взята версия: %s" % ("с Яндекс.Диска" if side == "left" else "с этого Mac")
+        what = "взята версия: %s" % (cfg.get("label") or "хранилище"
+                                     if side == "left" else "этот Mac")
 
     os.remove(c["local"])
     os.remove(c["remote"])
