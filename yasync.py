@@ -27,22 +27,48 @@ BACKEND_FLAGS, и там сейчас одна строка.
 """
 import json
 import os
+import shutil
 import subprocess
 import sys
 import time
 
 HOME = os.path.expanduser("~")
-RCLONE = os.path.join(HOME, "bin", "rclone")
-APPSUP = os.path.join(HOME, "Library", "Application Support")
-SUPPORT = os.path.join(APPSUP, "CloudSync")
+WINDOWS = sys.platform.startswith("win")
+
+
+def _support_dir():
+    """Где держать конфиг и состояние — по правилам своей системы."""
+    if WINDOWS:
+        base = os.environ.get("LOCALAPPDATA") or os.path.join(HOME, "AppData", "Local")
+        return os.path.join(base, "CloudSync"), None
+    base = os.path.join(HOME, "Library", "Application Support")
+    return os.path.join(base, "CloudSync"), os.path.join(base, "YandexSync")
+
+
+SUPPORT, _OLD_SUPPORT = _support_dir()
 # Установка, сделанная до переименования, продолжает работать со своим каталогом:
-# переносить состояние bisync на ходу опаснее, чем просто его найти.
-if not os.path.exists(SUPPORT) and os.path.exists(os.path.join(APPSUP, "YandexSync")):
-    SUPPORT = os.path.join(APPSUP, "YandexSync")
+# переносить живое состояние bisync опаснее, чем просто найти его на месте.
+if _OLD_SUPPORT and not os.path.exists(SUPPORT) and os.path.exists(_OLD_SUPPORT):
+    SUPPORT = _OLD_SUPPORT
 CONFIG = os.path.join(SUPPORT, "config.json")
 WORKDIR = os.path.join(SUPPORT, "bisync")
-LOGDIR = os.path.join(HOME, "Library", "Logs")
+LOGDIR = os.path.join(SUPPORT, "logs") if WINDOWS else os.path.join(HOME, "Library", "Logs")
 LOG = os.path.join(LOGDIR, "cloud-sync.log")
+
+
+def find_rclone():
+    """rclone рядом с нами, потом в PATH. Свой не ставим и не качаем."""
+    name = "rclone.exe" if WINDOWS else "rclone"
+    here = os.path.join(HOME, "bin", name)
+    if os.path.exists(here):
+        return here
+    return shutil.which(name) or here
+
+
+RCLONE = find_rclone()
+
+# Как называть локальную сторону в интерфейсе и сообщениях.
+THIS_MACHINE = "этот компьютер" if WINDOWS else "этот Mac"
 
 # Единственное место, где вообще упоминается конкретный провайдер. У Яндекса
 # загруженный файл появляется в листинге не мгновенно, и без этой паузы bisync
@@ -122,7 +148,15 @@ def save(cfg):
 
 def run(args, timeout=3600):
     """Запуск rclone. Возвращает (код, stdout, stderr)."""
-    p = subprocess.run([RCLONE] + args, capture_output=True, text=True, timeout=timeout)
+    kw = {}
+    if WINDOWS:
+        # Иначе у приложения из трея на каждый вызов мигает чёрное окно консоли.
+        kw["creationflags"] = 0x08000000          # CREATE_NO_WINDOW
+    try:
+        p = subprocess.run([RCLONE] + args, capture_output=True, text=True,
+                           encoding="utf-8", errors="replace", timeout=timeout, **kw)
+    except FileNotFoundError:
+        return 127, "", "rclone не найден: %s" % RCLONE
     return p.returncode, p.stdout, p.stderr
 
 
@@ -477,7 +511,7 @@ def cmd_conflicts(_):
     print("  конфликтов: %d" % len(c))
     for x in c:
         print("    %s / %s" % (x["folder"], x["base"]))
-        print("      этот Mac:   %s байт" % os.path.getsize(x["local"]))
+        print("      %-12s %s байт" % (THIS_MACHINE + ":", os.path.getsize(x["local"])))
         print("      %-11s %s байт" % ((cfg["label"] or "хранилище") + ":",
                                        os.path.getsize(x["remote"])))
     return 0
@@ -526,7 +560,8 @@ def cmd_state(_):
             "files": files, "bytes": size,
             "conflicts": sum(1 for c in conflicts if c["folder"] == f["remote"]),
         })
-    print(json.dumps({"root": cfg["root"], "log": LOG,
+    print(json.dumps({"root": cfg["root"], "log": LOG, "rclone": RCLONE,
+                      "rcloneFound": os.path.exists(RCLONE),
                       "remote": cfg["remote"], "label": cfg["label"],
                       "folders": folders,
                       "conflicts": [{"folder": c["folder"], "file": c["base"]}
@@ -618,7 +653,8 @@ def cmd_resolve(args):
     blocks = yadiff.build_blocks(left, right, base_lines)
     body = yadiff.page(c, blocks, mergeable, reader,
                        three_way=base_lines is not None,
-                       remote_label=cfg["label"] or "Хранилище").encode("utf-8")
+                       remote_label=cfg["label"] or "Хранилище",
+                       local_label=THIS_MACHINE).encode("utf-8")
     result = {"done": False}
 
     class Handler(http.server.BaseHTTPRequestHandler):
@@ -706,7 +742,7 @@ def apply_resolution(cfg, c, blocks, data, mergeable):
         with open(src, "rb") as a, open(base, "wb") as b2:
             b2.write(a.read())
         what = "взята версия: %s" % (cfg.get("label") or "хранилище"
-                                     if side == "left" else "этот Mac")
+                                     if side == "left" else THIS_MACHINE)
 
     os.remove(c["local"])
     os.remove(c["remote"])

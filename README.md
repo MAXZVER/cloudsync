@@ -1,4 +1,4 @@
-# yasync — selective cloud sync for macOS that does not run all day
+# yasync — selective cloud sync that does not run all day
 
 > 🇷🇺 [Русская версия](README.ru.md)
 
@@ -11,21 +11,26 @@ Dropbox, OneDrive, S3, WebDAV, SFTP. The provider is not baked in: you pick one 
 rclone remotes from the menu. Only one line of the code knows about a specific backend, and it is a
 `--yandex-upload-wait` quirk.
 
-Works on any Mac. Built and tested against Yandex.Disk on macOS Sequoia 15.7.9.
+**macOS and Windows.** Same engine, a native tray app on each side. Built and tested against
+Yandex.Disk on macOS Sequoia 15.7.9 and on Windows 11.
 
 | | |
 |---|---|
 | [`yasync.py`](yasync.py) | The engine: config, sync, conflict detection, ancestor snapshots |
 | [`yadiff.py`](yadiff.py) | Three-pane merge UI, served on `127.0.0.1` |
-| [`CloudSync.swift`](CloudSync.swift) | Menu-bar app: storage and folder picker, status, and the decision of *when* to sync |
+| [`CloudSync.swift`](CloudSync.swift) | macOS menu-bar app: storage and folder picker, status, and the decision of *when* to sync |
+| [`CloudSync.cs`](CloudSync.cs) | The same app for the Windows notification area |
 
-Dependencies: [`rclone`](https://rclone.org/) — one static binary — and macOS itself. The Python side
-is standard library only: no `pip`, no virtualenv. The Swift side is one file, built with the Command
-Line Tools; Xcode is not needed.
+Dependencies: [`rclone`](https://rclone.org/) — one static binary — plus Python 3 and whatever
+compiler the OS already ships. The Python side is standard library only: no `pip`, no virtualenv.
+The GUI is one source file per platform: `swiftc` on macOS (no Xcode), and on Windows the in-box
+`csc.exe` that comes with .NET Framework (no SDK, no Visual Studio).
 
 ---
 
 ## Install
+
+### macOS
 
 ```bash
 # rclone, if you do not have it
@@ -42,6 +47,24 @@ cp yasync.py yadiff.py ~/bin/ && chmod +x ~/bin/yasync.py
 swiftc -O CloudSync.swift -o ~/bin/CloudSync
 ~/bin/CloudSync &
 ```
+
+### Windows
+
+Put `rclone.exe` in `%USERPROFILE%\bin` or anywhere on `PATH`, then:
+
+```bat
+rclone config
+
+set CSC=C:\Windows\Microsoft.NET\Framework64\v4.0.30319\csc.exe
+%CSC% /target:winexe /out:CloudSync.exe CloudSync.cs /r:System.Web.Extensions.dll
+
+python yasync.py remotes
+python yasync.py init yandex:
+CloudSync.exe
+```
+
+Keep `yasync.py` and `yadiff.py` next to `CloudSync.exe` — that is where it looks for the engine
+first. The tray icon carries a coloured dot for the state; the menu is the same as on macOS.
 
 Pick the storage and the folders from the menu-bar icon, and turn on **Запускать при входе** to
 keep it there. The local root defaults to `~/<StorageName>` and is recorded in the config, so it
@@ -60,12 +83,12 @@ No timer, no polling loop. The app is idle until the kernel wakes it, and exactl
 
 | Trigger | Mechanism | Why |
 |---|---|---|
-| A file changed locally | `FSEventStream` on the sync root, 2 s kernel coalescing + 10 s debounce | Push from the kernel. A burst of saves costs one sync |
-| Finder became active | `NSWorkspace.didActivateApplicationNotification`, throttled to once per 2 min | The closest thing macOS has to "the user opened a folder" |
-| Woke from sleep | `NSWorkspace.didWakeNotification` | The remote has probably moved on while the lid was shut |
-| Network came back | `NWPathMonitor`, only after it had been down | Retry the sync that failed offline, once, when it can succeed |
+| A file changed locally | `FSEventStream` / `FileSystemWatcher` on the sync root, plus a 10 s debounce | Push from the kernel. A burst of saves costs one sync |
+| Finder / Explorer came to the front | `didActivateApplicationNotification` / `SetWinEventHook`, throttled to once per 2 min | The closest either OS has to "the user opened a folder" |
+| Woke from sleep | `didWakeNotification` / `SystemEvents.PowerModeChanged` | The remote has probably moved on while the lid was shut |
+| Network came back | `NWPathMonitor` / `NetworkChange`, only after it had been down | Retry the sync that failed offline, once, when it can succeed |
 
-**There is no "folder was opened" event in macOS.** No public API reports it and Finder does not
+**Neither OS has a "folder was opened" event.** No public API reports it and Finder does not
 broadcast it. Anything claiming otherwise is a polling loop or an AppleScript asking Finder for its
 front window. Finder activation is the honest approximation, which is why it is throttled.
 
@@ -148,10 +171,13 @@ one-sided insertion. The status bar labels that count approximate rather than pr
 
 ### Office documents
 
-`.docx`, `.doc`, `.rtf`, `.odt` are converted with `textutil`, which ships with macOS. `.xlsx` and
-`.pptx` are unzipped and their XML read with the standard library — spreadsheets come out as
-`Sheet!A1: value` lines, presentations as slide text. So you can *see* what differs inside an Office
-document.
+`.docx`, `.xlsx`, `.pptx`, `.odt`, `.ods` and `.odp` are all zip archives, and their XML is read with
+the standard library — so this works the same on both systems. Documents come out as one line per
+paragraph, spreadsheets as `Sheet!A1: value` lines, presentations as slide text. So you can *see*
+what differs inside an Office document.
+
+`.doc`, `.rtf` and `.webarchive` have no stdlib reader — they go through `textutil`, which exists only on
+macOS. On Windows the page says the format cannot be read rather than showing you garbage.
 
 You cannot rebuild a `.docx` from text, so those merge per-file rather than per-hunk: pick a side.
 The page says so instead of offering buttons that would produce a corrupt document.
@@ -165,7 +191,7 @@ The page says so instead of offering buttons that would produce a corrupt docume
 | Path | What |
 |---|---|
 | `~/<StorageName>/` | The synced folders themselves |
-| `~/Library/Application Support/CloudSync/config.json` | Which storage, which folders, when each last synced |
+| `…/CloudSync/config.json` | Which storage, which folders, when each last synced. Under `~/Library/Application Support` on macOS, `%LOCALAPPDATA%` on Windows |
 | `~/Library/Application Support/CloudSync/bisync/` | `rclone bisync` state |
 | `~/Library/Application Support/CloudSync/base/` | Gzipped ancestor snapshots |
 | `~/Library/Logs/cloud-sync.log` | Log |

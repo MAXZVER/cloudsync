@@ -1,18 +1,21 @@
 #!/usr/bin/env python3
 """Разрешение конфликтов: три панели, как в IDE.
 
-Слева — версия из хранилища, справа — версия с этого Mac, посередине живой
+Слева — версия из хранилища, справа — версия с этой машины, посередине живой
 результат. Шевроны в жёлобах добавляют сторону в результат; порядок нажатия
 задаёт порядок строк, поэтому «сначала левое, потом правое» и наоборот
 получаются без отдельных кнопок.
 
 Зависимостей нет — только стандартная библиотека.
 
-Офисные файлы сравниваются по тексту:
-  .docx .doc .rtf .odt   — через textutil, он встроен в macOS
-  .xlsx .pptx            — zip + XML разбираются стандартной библиотекой
-Собрать .docx обратно из текста нельзя, поэтому для них доступен только выбор
-версии целиком.
+Офисные файлы сравниваются по тексту, и почти всё читается стандартной
+библиотекой, поэтому работает и на macOS, и на Windows:
+  .docx .xlsx .pptx      — zip + XML
+  .odt .ods .odp         — zip + XML
+  .doc .rtf .webarchive  — только macOS, через встроенный textutil
+  .xls .ppt              — старые двоичные, не читаются нигде
+Собрать документ обратно из текста нельзя, поэтому для них доступен только
+выбор версии целиком.
 
 Про автослияние. Двух версий для него мало: строка есть слева и нет справа —
 это либо «слева добавили», либо «справа удалили», и дифф эти случаи не
@@ -30,13 +33,19 @@ import json
 import os
 import re
 import subprocess
+import sys
 import zipfile
 import xml.etree.ElementTree as ET
 from difflib import SequenceMatcher
 
-TEXTUTIL_EXT = {".doc", ".docx", ".rtf", ".odt", ".rtfd", ".html", ".htm", ".webarchive"}
+MACOS = sys.platform == "darwin"
+# То, для чего в стандартной библиотеке ничего нет. На Windows честно скажем,
+# что не прочитали, вместо того чтобы выдать мусор.
+TEXTUTIL_EXT = {".doc", ".rtf", ".rtfd", ".webarchive"}
 NS_MAIN = "{http://schemas.openxmlformats.org/spreadsheetml/2006/main}"
 NS_DRAW = "{http://schemas.openxmlformats.org/drawingml/2006/main}"
+NS_WORD = "{http://schemas.openxmlformats.org/wordprocessingml/2006/main}"
+NS_ODF_T = "{urn:oasis:names:tc:opendocument:xmlns:text:1.0}"
 
 
 # ------------------------------------------------------------------ чтение
@@ -46,6 +55,48 @@ def is_binary(path):
             return b"\0" in f.read(8192)
     except OSError:
         return True
+
+
+def docx_text(path):
+    """Абзацы .docx. Один абзац — одна строка; так же его придётся резать,
+    когда дойдут руки до настоящего слияния с сохранением форматирования."""
+    try:
+        z = zipfile.ZipFile(path)
+        root = ET.fromstring(z.read("word/document.xml"))
+    except (zipfile.BadZipFile, KeyError, OSError, ET.ParseError):
+        return None
+    out = []
+    for para in root.iter(NS_WORD + "p"):
+        buf = []
+        for el in para.iter():
+            tag = el.tag
+            if tag == NS_WORD + "t" and el.text:
+                buf.append(el.text)
+            elif tag == NS_WORD + "tab":
+                buf.append("\t")
+            elif tag in (NS_WORD + "br", NS_WORD + "cr"):
+                buf.append(" ")
+        out.append("".join(buf))
+    # Хвостовые пустые абзацы ничего не значат, а дифф ими шумит.
+    while out and not out[-1].strip():
+        out.pop()
+    return "\n".join(out)
+
+
+def odf_text(path):
+    """Абзацы и заголовки .odt / .ods / .odp."""
+    try:
+        z = zipfile.ZipFile(path)
+        root = ET.fromstring(z.read("content.xml"))
+    except (zipfile.BadZipFile, KeyError, OSError, ET.ParseError):
+        return None
+    out = []
+    for el in root.iter():
+        if el.tag in (NS_ODF_T + "p", NS_ODF_T + "h"):
+            out.append("".join(el.itertext()))
+    while out and not out[-1].strip():
+        out.pop()
+    return "\n".join(out)
 
 
 def textutil(path):
@@ -101,18 +152,28 @@ def pptx_text(path):
     return "\n".join(out)
 
 
+ZIP_READERS = {
+    ".docx": (docx_text, "разбор docx"),
+    ".xlsx": (xlsx_text, "разбор xlsx"),
+    ".pptx": (pptx_text, "разбор pptx"),
+    ".odt":  (odf_text,  "разбор odt"),
+    ".ods":  (odf_text,  "разбор ods"),
+    ".odp":  (odf_text,  "разбор odp"),
+}
+
+
 def to_lines(path):
     """(строки, можно_ли_сливать, чем_прочитано)."""
     ext = os.path.splitext(path)[1].lower()
+    if ext in ZIP_READERS:
+        reader, how = ZIP_READERS[ext]
+        t = reader(path)
+        return (t.splitlines() if t is not None else None), False, how
     if ext in TEXTUTIL_EXT:
+        if not MACOS:
+            return None, False, "формат читается только на macOS"
         t = textutil(path)
         return (t.splitlines() if t else None), False, "textutil"
-    if ext == ".xlsx":
-        t = xlsx_text(path)
-        return (t.splitlines() if t else None), False, "разбор xlsx"
-    if ext == ".pptx":
-        t = pptx_text(path)
-        return (t.splitlines() if t else None), False, "разбор pptx"
     if ext in (".xls", ".ppt"):
         return None, False, "старый двоичный формат"
     if is_binary(path):
@@ -956,7 +1017,8 @@ def stamp(path):
                                st.st_size)
 
 
-def page(conflict, blocks, mergeable, reader, three_way=False, remote_label="Хранилище"):
+def page(conflict, blocks, mergeable, reader, three_way=False, remote_label="Хранилище",
+         local_label="эта машина"):
     name = html.escape(os.path.basename(conflict["base"]))
     sub = "%s  ·  читаем как: %s  ·  %s" % (
         html.escape(conflict["folder"]), reader,
@@ -979,9 +1041,10 @@ def page(conflict, blocks, mergeable, reader, three_way=False, remote_label="Х�
             blk["pairs"] = pairs
     data = {
         "leftLabel": "%s  ·  %s" % (remote_label, stamp(conflict["remote"])),
-        "rightLabel": "Этот Mac  ·  %s" % stamp(conflict["local"]),
+        "rightLabel": "%s  ·  %s" % (local_label[0].upper() + local_label[1:],
+                                     stamp(conflict["local"])),
         "leftName": remote_label,
-        "rightName": "этот Mac",
+        "rightName": local_label,
         "newer": "left" if os.path.getmtime(conflict["remote"])
                  > os.path.getmtime(conflict["local"]) else "right",
         "threeWay": bool(three_way),
