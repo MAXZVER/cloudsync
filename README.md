@@ -201,6 +201,12 @@ yasync.py resolve doc.txt     # opens the merge page
 - **Only one backend quirk is handled** (`--yandex-upload-wait`). Another provider may need its own;
   that is one line in `BACKEND_FLAGS`.
 
+## Working on this
+
+[HANDOFF.ru.md](HANDOFF.ru.md) — internals, what is already verified on real
+hardware, the traps I walked into, and what is deliberately not done yet. Read it before changing
+the merge algorithm or the wake-up logic. In Russian.
+
 ## License
 
 [MIT](LICENSE).
